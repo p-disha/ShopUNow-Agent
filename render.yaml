@@ -5,10 +5,10 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: >
-      voila notebooks/ShopUNow.ipynb
+      voila ShopUNow.ipynb
       --no-browser
       --port $PORT
       --VoilaApp.ip=0.0.0.0
     envVars:
       - key: FAQ_PATH
-        value: data/shopunow_faqs.jsonl
+        value: shopunow_faqs.jsonl
