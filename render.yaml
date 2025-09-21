@@ -3,9 +3,13 @@ services:
     name: shopunow-notebook
     env: python
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: >
       python -m voila ShopUNow.ipynb
       --no-browser
       --VoilaApp.ip=0.0.0.0
       --VoilaApp.port=$PORT
+    envVars:
+      - key: FAQ_PATH
+        value: shopunow_faqs.jsonl
