@@ -1,0 +1,12 @@
+voila>=0.5
+jupyter>=1.0
+ipywidgets>=8.0
+faiss-cpu
+langchain>=0.2
+langchain-community>=0.2
+langchain-core>=0.2
+langchain-openai>=0.1
+openai>=1.0
+tiktoken
+numpy
+pandas
