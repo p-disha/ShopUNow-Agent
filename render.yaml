@@ -12,3 +12,5 @@ services:
     envVars:
       - key: FAQ_PATH
         value: shopunow_faqs.jsonl
+      - key: OPENAI_API_KEY   # add this if your notebook calls OpenAI
+        sync: false           # sync:false means you’ll set it in Render dashboard
