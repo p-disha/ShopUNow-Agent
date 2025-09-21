@@ -77,7 +77,7 @@ It combines:
 
 ## 🛠️ Setup & Installation
 
-1. **Clone & Install** ```
+1. **Clone & Install** 
    ```bash
    git clone https://github.com/<your-repo>/shopunow-agent.git
    cd shopunow-agent
