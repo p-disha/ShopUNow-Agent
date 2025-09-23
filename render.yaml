@@ -1,6 +1,6 @@
 services:
   - type: web
     name: shopunow-notebook
-    plan: free
     env: docker
+    plan: free
     dockerfilePath: ./Dockerfile
