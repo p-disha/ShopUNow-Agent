@@ -1,6 +1,9 @@
 services:
   - type: web
     name: shopunow-notebook
-    env: docker
     plan: free
+    env: docker
     dockerfilePath: ./Dockerfile
+    envVars:
+      - key: FAQ_PATH
+        value: shopunow_faqs.jsonl
