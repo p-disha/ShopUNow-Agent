@@ -1,10 +1,24 @@
-# render.yaml
 services:
   - type: web
-    name: shopunow-notebook
+    name: shopunow-backend
+    env: python
     plan: free
-    env: docker
-    dockerfilePath: ./Dockerfile
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      python -m flask run --host=0.0.0.0 --port=$PORT
     envVars:
+      - key: FLASK_APP
+        value: app_backend.py
       - key: FAQ_PATH
         value: shopunow_faqs.jsonl
+
+  - type: web
+    name: shopunow-frontend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      streamlit run app_frontend.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: BACKEND_URL
+        value: https://shopunow-backend.onrender.com/ask
