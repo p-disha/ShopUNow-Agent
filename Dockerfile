@@ -28,4 +28,4 @@ USER appuser
 EXPOSE 10000
 
 # Run Voilà binding to host 0.0.0.0 and dynamic port
-CMD python -m voila ShopUNow.ipynb --no-browser --VoilaApp.ip=0.0.0.0 --VoilaApp.port=$PORT
+CMD ["sh", "-c", "python -m voila ShopUNow.ipynb --no-browser --VoilaApp.ip=0.0.0.0 --VoilaApp.port=${PORT:-8866}"]
