@@ -4,6 +4,7 @@ gunicorn==20.1.0
 
 faiss-cpu==1.12.0
 numpy==2.0.2
+voila
 
 pydantic==2.11.9
 vaderSentiment==3.3.2
