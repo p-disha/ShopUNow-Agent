@@ -1,24 +1,27 @@
+# render.yaml (in your repo root)
 services:
   - type: web
     name: shopunow-backend
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: >
-      python -m flask run --host=0.0.0.0 --port=$PORT
+    plan: starter
+    buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow.ipynb
+    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 2
+    healthCheckPath: /ask
     envVars:
-      - key: FLASK_APP
-        value: app_backend.py
-      - key: FAQ_PATH
-        value: shopunow_faqs.jsonl
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
 
   - type: web
     name: shopunow-frontend
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: >
-      streamlit run app_frontend.py --server.port $PORT --server.address 0.0.0.0
+    plan: starter
+    buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow_frontend.ipynb
+    startCommand: streamlit run app_frontend.py --server.port $PORT
     envVars:
       - key: BACKEND_URL
-        value: https://shopunow-backend.onrender.com/ask
+        fromService:
+          name: shopunow-backend
+          type: web
+          property: url
