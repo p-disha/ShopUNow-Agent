@@ -867,51 +867,52 @@ else:
         flask_app.run(host="0.0.0.0", port=PORT)
 
 # =========================
-# Cell D - Streamlit Frontend (Auto-detect backend, Mandatory Keys, LangSmith optional)
+# Cell D – Streamlit Frontend (Colab dev only; skip in Render)
 # =========================
 import os
+import subprocess
+import threading
 
-# --- Guard: skip this entire cell on Render (frontend will be deployed separately) ---
-if os.getenv("RENDER_SERVICE_TYPE") or os.getenv("RENDER") or os.getenv("PORT"):
-    print("[Render] Detected Render environment. Skipping Streamlit frontend cell.")
+# Skip frontend in Render / production environment
+if os.getenv("RENDER_SERVICE_TYPE") or os.getenv("PORT"):
+    print("[Render] Skipping Streamlit frontend cell.")
 else:
-    import subprocess, threading
+    # Dev / Colab mode: ensure required libs
+    try:
+        import streamlit
+        import requests
+        import pyngrok
+    except ImportError:
+        # Install if missing, but use subprocess to avoid !pip syntax
+        deps = ["streamlit", "requests", "pyngrok"]
+        subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps], check=False)
 
-    # Colab-only installs
-    !pip install -q streamlit requests pyngrok
-
-    # Try to auto-read backend URL from file
+    # Determine backend URL (auto-detect)
     backend_url_file = "/content/backend_url.txt"
     default_api_url = "http://127.0.0.1:5000/ask"
     if os.path.exists(backend_url_file):
         try:
             with open(backend_url_file, "r") as f:
                 url = f.read().strip()
-                if url:
-                    default_api_url = url.rstrip("/") + "/ask"
+            if url:
+                default_api_url = url.rstrip("/") + "/ask"
         except Exception as e:
             print("⚠️ Could not read backend_url.txt:", e)
 
+    # Create a Streamlit app file
     with open("app_frontend.py", "w") as f:
         f.write(f"""
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="ShopUNow Agent", page_icon="🛍️", layout="centered")
+st.set_page_config(page_title="ShopUNow Agent", layout="centered")
 st.title("🛍️ ShopUNow AI Assistant")
 
-# --- Sidebar: Configuration ---
-st.sidebar.header("🔑 Configuration (Required)")
-
-api_url = st.sidebar.text_input("Flask API URL (auto-detected from backend)", value="{default_api_url}")
+api_url = st.sidebar.text_input("Flask API URL", value="{default_api_url}")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
 gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
 ngrok_token = st.sidebar.text_input("ngrok Auth Token", type="password")
 
-st.sidebar.header("Optional")
-langsmith_key = st.sidebar.text_input("LangSmith Key (optional)", type="password")
-
-# ---- Validation ----
 errors = []
 if not api_url.strip():
     errors.append("❌ Flask API URL is required.")
@@ -927,22 +928,18 @@ if errors:
 else:
     st.sidebar.success("✅ All required configuration set")
 
-# Store secrets
-st.session_state.secrets = {{
+st.session_state.setdefault("secrets", {{
     "API_URL": api_url.strip(),
     "OPENAI_API_KEY": openai_key.strip(),
     "GEMINI_API_KEY": gemini_key.strip(),
-    "NGROK_AUTH_TOKEN": ngrok_token.strip(),
-    "LANGSMITH_KEY": langsmith_key.strip(),
-}}
+    "NGROK_AUTH_TOKEN": ngrok_token.strip()
+}})
 
-# --- Chat Section ---
 st.subheader("💬 Chat with ShopUNow Agent")
-
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
-query = st.text_input("Type your question here:")
+query = st.text_input("Enter your question:")
 
 if st.button("Ask"):
     if query.strip():
@@ -950,30 +947,30 @@ if st.button("Ask"):
         try:
             resp = requests.post(st.session_state.secrets["API_URL"], json={{"query": query}}, timeout=20)
             if resp.status_code == 200:
-                data = resp.json()
-                answer = data.get("answer", "⚠️ No answer returned")
+                answer = resp.json().get("answer", "⚠️ No answer returned")
             else:
                 answer = f"⚠️ Error {{resp.status_code}}: {{resp.text}}"
-        except Exception as e:
-            answer = f"⚠️ Request failed: {{e}}"
-
+        except Exception as error:
+            answer = f"⚠️ Request failed: {{error}}"
         st.session_state.chat.append(("🤖 Agent", answer))
 
-# --- Display chat history ---
 for sender, msg in st.session_state.chat:
     st.markdown(f"**{{sender}}:** {{msg}}")
 """)
 
-    # ---- Run Streamlit in background ----
+    # Launch Streamlit in background
     def run_streamlit():
         subprocess.run(
-            ["streamlit", "run", "app_frontend.py", "--server.port", "8501", "--server.headless", "true"]
+            [sys.executable, "-m", "streamlit", "run", "app_frontend.py", "--server.port", "8501", "--server.headless", "true"]
         )
 
     threading.Thread(target=run_streamlit, daemon=True).start()
 
-    # ---- ngrok tunnel for frontend (Colab) ----
-    from pyngrok import ngrok
-    print("🌐 Starting ngrok tunnel for Streamlit...")
-    frontend_url = ngrok.connect(8501)
-    print("🚀 Streamlit Frontend URL:", frontend_url)
+    # If ngrok token is provided, start a tunnel
+    try:
+        from pyngrok import ngrok
+        print("🌐 Starting ngrok tunnel for Streamlit frontend...")
+        frontend_url = ngrok.connect(8501)
+        print("🚀 Frontend URL:", frontend_url)
+    except Exception as e:
+        print("⚠️ Could not start frontend ngrok tunnel:", e)
