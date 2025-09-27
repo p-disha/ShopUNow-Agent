@@ -47,239 +47,290 @@ Sentence-Transformers embeddings-	To convert document chunks into embedding vect
 """
 
 # =========================
-# Cell A – Setup & LLM with safer secret handling
+# Cell A – Setup & LLM with safer secret handling (Render-safe)
 # =========================
-
 import os
 import subprocess
 import sys
-import json
-import random
-import numpy as np
+import threading
 
-# -- Install dev dependencies (only in Colab/dev)
-if not os.getenv("RENDER_SERVICE_TYPE") and not os.getenv("PORT"):
+# Detect runtime
+IS_RENDER = bool(os.getenv("PORT") or os.getenv("RENDER_SERVICE_TYPE"))
+
+# ---------------------------------------------
+# Dev-only dependency install (skip in Render)
+# ---------------------------------------------
+if not IS_RENDER:
     deps = [
-        "langchain_community",
-        "faiss-cpu",
-        "langchain-openai",
-        "langchain-google-genai",
-        "pydantic",
-        "typing_extensions",
-        "vaderSentiment",
-        "langgraph",
-        "rapidfuzz",
-        "flask",
-        "flask-cors",
-        "pyngrok",
+        "langchain_community", "faiss-cpu", "langchain-openai",
+        "langchain-google-genai", "pydantic", "typing_extensions",
+        "vaderSentiment", "langgraph", "rapidfuzz", "flask",
+        "flask-cors", "pyngrok"
     ]
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps], check=False)
     except Exception as ex:
-        print("⚠️ Dev install failed:", ex)
+        print("⚠️ Dev install failed:", ex, flush=True)
 
-# -- Import core modules
-try:
-    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain_community.vectorstores import FAISS
-    from langchain_community.docstore.in_memory import InMemoryDocstore
-    from langchain_core.documents import Document
-    from langchain_core.messages import HumanMessage, SystemMessage
-    import faiss
-except ImportError as e:
-    raise ImportError(
-        "Missing required LangChain integration modules. "
-        "Make sure `langchain-openai` and `langchain-google-genai` are installed."
-    ) from e
+# ---------------------------------------------
+# Secrets / API Keys
+# ---------------------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# -- Try to fetch secrets from Colab user secrets if available
-openai_secret = None
-gemini_secret = None
-try:
-    from google.colab import userdata
-    openai_secret = userdata.get("OPENAI_API_KEY")
-    gemini_secret = userdata.get("GEMINI_API_KEY")
+if not IS_RENDER:
+    try:
+        # Only attempt in Colab
+        from google.colab import userdata  # type: ignore
+        OPENAI_API_KEY = OPENAI_API_KEY or userdata.get("OPENAI_API_KEY")
+        GEMINI_API_KEY = GEMINI_API_KEY or userdata.get("GEMINI_API_KEY")
+        if OPENAI_API_KEY:
+            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        if GEMINI_API_KEY:
+            os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+    except Exception:
+        pass  # ignore if not in Colab
 
-except Exception as e:
-    print("Could not import google.colab.userdata (maybe not in Colab):", e)
-
-# -- Set environment variables if secrets exist
-if openai_secret:
-    os.environ["OPENAI_API_KEY"] = openai_secret
-if gemini_secret:
-    os.environ["GOOGLE_API_KEY"] = gemini_secret
-
-# -- Read keys from environment now
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
-
-# -- Assertion: require at least one key in production (not in dev)
-if os.getenv("PORT") or os.getenv("RENDER_SERVICE_TYPE"):
-    # In Render / production
+if IS_RENDER:
     assert OPENAI_API_KEY or GEMINI_API_KEY, (
-        "In production, you must set OPENAI_API_KEY or GEMINI_API_KEY."
+        "Production requires OPENAI_API_KEY or GOOGLE_API_KEY."
     )
-else:
-    # In Colab/dev: warn if none
-    if not (OPENAI_API_KEY or GEMINI_API_KEY):
-        print("⚠️ Warning: No API keys set. Some functionality may be limited.")
 
-# -- Proceed with embeddings, vector store, etc.
-embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-faq_docs = [
-    Document(page_content="Support hours are 9 AM–9 PM IST, Monday to Saturday", metadata={"department": "Customer Support"}),
-    Document(page_content="How to contact support email or phone", metadata={"department": "Customer Support"}),
-    Document(page_content="Return window is 10 days from delivery", metadata={"department": "Orders & Returns"}),
-    Document(page_content="How can I initiate a return process", metadata={"department": "Orders & Returns"}),
-    Document(page_content="We accept UPI, credit cards, wallets, and COD", metadata={"department": "Payments & Billing"}),
-    Document(page_content="How to apply coupon at checkout", metadata={"department": "Payments & Billing"})
-]
+# ---------------------------------------------
+# Lazy Initialization Flags
+# ---------------------------------------------
+EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
+LLM = None
+vector_store = None
+faq_docs = None
+_initialized = False
+_init_lock = threading.Lock()
 
-dim = len(embeddings.embed_query("hello world"))
-index = faiss.IndexFlatL2(dim)
-vector_store = FAISS(
-    embedding_function=embeddings,
-    index=index,
-    docstore=InMemoryDocstore({}),
-    index_to_docstore_id={}
-)
-ids = [f"doc{i+1}" for i in range(len(faq_docs))]
-vector_store.add_documents(documents=faq_docs, ids=ids)
+# ---------------------------------------------
+# Lazy Init Function (defers FAISS & LLM setup)
+# ---------------------------------------------
+def initialize_backend():
+    """Thread-safe one-time heavy setup for embeddings, FAISS, and LLM."""
+    global _initialized, vector_store, faq_docs, LLM
+    if _initialized:
+        return True
 
+    with _init_lock:
+        if _initialized:
+            return True
+        try:
+            print("⚙️ Initializing FAISS + LLM …", flush=True)
+
+            # ---- Import heavy modules lazily ----
+            from langchain_openai import OpenAIEmbeddings
+            from langchain_core.documents import Document
+            from langchain_community.vectorstores import FAISS
+            from langchain_community.docstore.in_memory import InMemoryDocstore
+            import faiss
+
+            # ---- Tiny seed docs (safe for cold start) ----
+            faq_docs = [
+                Document(page_content="Support hours are 9 AM–9 PM IST, Monday–Saturday", metadata={"department": "Customer Support"}),
+                Document(page_content="Return window is 10 days from delivery", metadata={"department": "Orders & Returns"}),
+                Document(page_content="We accept UPI, credit cards, wallets & COD", metadata={"department": "Payments & Billing"})
+            ]
+
+            # ---- Embeddings + FAISS store ----
+            embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+            dim = len(embeddings.embed_query("hello world"))
+            index = faiss.IndexFlatL2(dim)
+            vector_store = FAISS(
+                embedding_function=embeddings,
+                index=index,
+                docstore=InMemoryDocstore({}),
+                index_to_docstore_id={}
+            )
+            vector_store.add_documents(faq_docs, ids=[f"doc{i}" for i in range(len(faq_docs))])
+
+            # ---- Initialize LLM lazily ----
+            LLM = get_chat_model()
+
+            _initialized = True
+            print("✅ Backend initialization complete.", flush=True)
+            return True
+
+        except Exception as e:
+            print("❌ Backend init failed:", e, flush=True)
+            return False
+
+# ---------------------------------------------
+# Chat Model Getter
+# ---------------------------------------------
 def get_chat_model():
+    """Returns available LLM (Gemini > OpenAI > mock)."""
     if GEMINI_API_KEY:
         try:
-            print("Using Gemini LLM")
+            from langchain_google_genai import ChatGoogleGenerativeAI
             return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
         except Exception as e:
-            print("Gemini init failed:", e)
+            print("Gemini init failed:", e, flush=True)
+
     if OPENAI_API_KEY:
         try:
-            print("Using OpenAI model")
+            from langchain_openai import ChatOpenAI
             return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
         except Exception as e:
-            print("OpenAI init failed:", e)
+            print("OpenAI init failed:", e, flush=True)
+
+    # Fallback mock model
+    from langchain_core.messages import HumanMessage
     class _Mock:
-        def invoke(self, messages):
-            last_user = None
-            for m in reversed(messages):
-                if isinstance(m, HumanMessage):
-                    last_user = m
-                    break
-            return type("Resp", (), {"content": "[MOCK] " + (last_user.content if last_user else "")})
-    print("Using mock LLM fallback")
+        def invoke(self, msgs):
+            last = next((m.content for m in reversed(msgs) if isinstance(m, HumanMessage)), "")
+            return type("Resp", (), {"content": "[MOCK] " + last})
+    print("🧩 Using mock LLM fallback", flush=True)
     return _Mock()
 
-LLM = get_chat_model()
-
 SYSTEM_POLICY = (
-    "You are ShopUNow Assistant. Be concise and accurate. Use the internal knowledge base when possible. "
-    "If unable to answer, ask a clarifying question."
+    "You are ShopUNow Assistant. Be concise and accurate. "
+    "Use internal knowledge base when possible. "
+    "If unsure, ask a clarifying question."
 )
 
-print("Cell A setup complete: vector store and LLM initialised.")
+print("✅ Cell A loaded — heavy init deferred until first use.")
 
 # =========================
-# Cell A.1 - Load FAQ Dataset & Build Vector Store
+# Cell A.1 – Lazy Load FAQ Dataset & Build Vector Store (Render-safe)
 # =========================
 import os
 import json
 import faiss
+import threading
+from typing import List, Tuple
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_openai import OpenAIEmbeddings
 
-# ---- Step 1: Determine JSONL path ----
-def resolve_faq_path():
-    colab_path = "/content/shopunow_faqs.jsonl"
-    if os.path.exists(colab_path):
-        return colab_path
-    # fallback to repo-based path (assuming file sits in “data/” or project root)
-    base = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    candidate = os.path.join(base, "data", "shopunow_faqs.jsonl")
-    if os.path.exists(candidate):
-        return candidate
-    # fallback: try base directory
-    candidate2 = os.path.join(base, "shopunow_faqs.jsonl")
-    if os.path.exists(candidate2):
-        return candidate2
-    # else not found
-    return None
+# --- Global cache + lock ---
+_FAQ_VECTOR_STORE = None
+_FAQ_DOCS: List[Document] = []
+_FAQ_PATH = None
+_FAQ_INIT_LOCK = threading.Lock()
 
-faq_path = resolve_faq_path()
-if not faq_path:
-    raise FileNotFoundError(
-        f"❌ shopunow_faqs.jsonl not found. Searched common paths."
-    )
 
-# ---- Step 2: Load JSONL file ----
-faq_docs = []
-with open(faq_path, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-            question = record.get("question", "").strip()
-            answer = record.get("answer", "").strip()
-            dept = record.get("department", "unknown").strip()
-            combined_text = f"Q: {question}\\nA: {answer}"
-            faq_docs.append(
-                Document(
-                    page_content=combined_text,
-                    metadata={"department": dept, "question": question, "answer": answer}
+def resolve_faq_path() -> str:
+    """
+    Resolve path to the FAQ JSONL file across common environments.
+    """
+    candidates = [
+        "/content/shopunow_faqs.jsonl",
+        os.path.join(os.getcwd(), "data", "shopunow_faqs.jsonl"),
+        os.path.join(os.getcwd(), "shopunow_faqs.jsonl"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    raise FileNotFoundError("❌ shopunow_faqs.jsonl not found in common paths.")
+
+
+def load_faq_documents(path: str) -> List[Document]:
+    """
+    Load and parse JSONL file into LangChain Documents.
+    """
+    docs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                question = record.get("question", "").strip()
+                answer = record.get("answer", "").strip()
+                dept = record.get("department", "unknown").strip()
+                if not question or not answer:
+                    continue
+                combined_text = f"Q: {question}\nA: {answer}"
+                docs.append(
+                    Document(
+                        page_content=combined_text,
+                        metadata={
+                            "department": dept,
+                            "question": question,
+                            "answer": answer,
+                        },
+                    )
                 )
-            )
-        except json.JSONDecodeError as e:
-            print(f"⚠️ Skipping bad line (invalid JSON): {line[:80]} … | {e}")
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Skipping invalid JSON line: {e}")
+    return docs
 
-print(f"Loaded {len(faq_docs)} FAQs from {faq_path}")
 
-# ---- Step 3: Build FAISS Vector Store ----
-try:
+def build_faq_vector_store(docs: List[Document]) -> FAISS:
+    """
+    Build FAISS vector store with normalized embeddings.
+    """
+    if not docs:
+        raise ValueError("No FAQ documents to build vector store.")
     embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize embeddings: {e}")
+    dim = len(embedding_model.embed_query("hello world"))
+    index = faiss.IndexFlatIP(dim)
+    store = FAISS(
+        embedding_function=embedding_model,
+        index=index,
+        docstore=InMemoryDocstore(),
+        index_to_docstore_id={},
+    )
+    ids = [f"faq_{i+1}" for i in range(len(docs))]
+    store.add_documents(docs, ids=ids)
+    return store
 
-# compute dim
-dim = len(embedding_model.embed_query("hello world"))
-faiss_index = faiss.IndexFlatIP(dim)
 
-faq_vector_store = FAISS(
-    embedding_function=embedding_model,
-    index=faiss_index,
-    docstore=InMemoryDocstore(),
-    index_to_docstore_id={}
-)
+def get_faq_vector_store() -> Tuple[FAISS, List[Document]]:
+    """
+    Lazy initializer for the FAQ vector store.
+    Safe for multi-threaded Gunicorn startup.
+    """
+    global _FAQ_VECTOR_STORE, _FAQ_DOCS, _FAQ_PATH
 
-faq_ids = [f"faq_{i+1}" for i in range(len(faq_docs))]
-faq_vector_store.add_documents(documents=faq_docs, ids=faq_ids)
+    if _FAQ_VECTOR_STORE is not None:
+        return _FAQ_VECTOR_STORE, _FAQ_DOCS
 
-dept_set = {d.metadata.get("department", "unknown") for d in faq_docs}
-print(f"✅ Vector store built with {len(faq_docs)} FAQs across {len(dept_set)} departments")
+    with _FAQ_INIT_LOCK:
+        if _FAQ_VECTOR_STORE is not None:
+            return _FAQ_VECTOR_STORE, _FAQ_DOCS
+        try:
+            _FAQ_PATH = resolve_faq_path()
+            _FAQ_DOCS = load_faq_documents(_FAQ_PATH)
+            _FAQ_VECTOR_STORE = build_faq_vector_store(_FAQ_DOCS)
+            dept_set = {d.metadata.get("department", "unknown") for d in _FAQ_DOCS}
+            print(
+                f"✅ Built vector store with {len(_FAQ_DOCS)} FAQs across {len(dept_set)} departments",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"❌ Error initializing FAQ store: {e}", flush=True)
+            raise
+
+    return _FAQ_VECTOR_STORE, _FAQ_DOCS
 
 # =========================
-# Cell B - Agent Definition with JSONL Vector Store
-# (cosine sim + dept thresholds + tie-aware classifier + escalation & confidence)
+# Cell B — Agent (lazy FAQ store, cosine/IP thresholds, escalation)
 # =========================
 
 import os
 import json
-import faiss
 import numpy as np
 import random
-from typing import Optional, List, Dict, Any, Literal, Tuple, Annotated
+from typing import Optional, List, Dict, Any, Literal, Tuple
 from pydantic import BaseModel, Field
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from rapidfuzz import fuzz
 
+# LangChain base
 from langchain_core.documents import Document
-from langchain_community.vectorstores import FAISS
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_openai import OpenAIEmbeddings
+
+# ✅ Import lazy FAQ loader (refactored Cell A.1)
+try:
+    from shopunow_faq import get_faq_vector_store  # if using separate module
+except ImportError:
+    from __main__ import get_faq_vector_store      # fallback for Colab single-file mode
 
 # --------------------
 # Determinism
@@ -288,100 +339,34 @@ random.seed(42)
 np.random.seed(42)
 
 # --------------------
-# Load JSONL FAQs
+# Lazy sentiment
 # --------------------
-def _resolve_jsonl_path():
-    # Try Colab default path
-    colab_path = "/content/shopunow_faqs.jsonl"
-    if os.path.exists(colab_path):
-        return colab_path
-    # Fallback: file located in repo (same folder as script/notebook)
-    base = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    fallback = os.path.join(base, "shopunow_faqs.jsonl")
-    return fallback
-
-jsonl_path = _resolve_jsonl_path()
-faq_documents: List[Document] = []
-if os.path.exists(jsonl_path):
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            rec = json.loads(raw)
-            question = rec.get("question", "").strip()
-            answer = rec.get("answer", "").strip()
-            dept = rec.get("department", "unknown").strip()
-            combined_text = f"Q: {question}\\nA: {answer}"
-            faq_documents.append(
-                Document(
-                    page_content=combined_text,
-                    metadata={
-                        "department": dept,
-                        "question": question,
-                        "answer": answer
-                    }
-                )
-            )
-    print(f"Loaded {len(faq_documents)} FAQs from {jsonl_path}")
-else:
-    raise FileNotFoundError(f"FAQ JSONL file not found at {jsonl_path}")
-
-# --------------------
-# Embeddings (cosine)
-# --------------------
-class NormalizedOpenAIEmbeddings(OpenAIEmbeddings):
-    def embed_query(self, text: str) -> List[float]:
-        v = np.array(super().embed_query(text))
-        return (v / (np.linalg.norm(v) + 1e-10)).tolist()
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        vs = np.array(super().embed_documents(texts))
-        return (vs / (np.linalg.norm(vs, axis=1, keepdims=True) + 1e-10)).tolist()
-
-embedding_model = NormalizedOpenAIEmbeddings(model="text-embedding-ada-002")
-dim = len(embedding_model.embed_query("hello world"))
-faiss_index = faiss.IndexFlatIP(dim)
-
-faq_vector_store = FAISS(
-    embedding_function=embedding_model,
-    index=faiss_index,
-    docstore=InMemoryDocstore(),
-    index_to_docstore_id={}
-)
-
-faq_ids = [f"faq_{i+1}" for i in range(len(faq_documents))]
-faq_vector_store.add_documents(documents=faq_documents, ids=faq_ids)
-
-dept_count = len(set(d.metadata.get("department", "unknown") for d in faq_documents))
-print(f"✅ Vector store ready with {len(faq_documents)} docs across {dept_count} departments")
-
-# --------------------
-# Sentiment
-# --------------------
-sentiment_analyzer = SentimentIntensityAnalyzer()
-
-def detect_sentiment(text: str) -> Literal["negative","neutral","positive"]:
+_SENTIMENT = None
+def detect_sentiment(text: str) -> Literal["negative", "neutral", "positive"]:
+    global _SENTIMENT
+    if _SENTIMENT is None:
+        _SENTIMENT = SentimentIntensityAnalyzer()
     if not text:
         return "neutral"
-    c = sentiment_analyzer.polarity_scores(text).get("compound", 0.0)
-    if c <= -0.3: return "negative"
-    if c >= 0.3: return "positive"
+    c = _SENTIMENT.polarity_scores(text).get("compound", 0.0)
+    if c <= -0.3:
+        return "negative"
+    if c >= 0.3:
+        return "positive"
     return "neutral"
 
-# ... (rest of your code: classify_department_with_confidence, route_intent, tool_node, synthesis_node, graph building, ask function) ...
-
 # --------------------
-# Dept classifier with confidence & tie handling
+# Department classifier
 # --------------------
 DEPT_KEYWORDS: Dict[str, List[str]] = {
     "Orders & Returns": [
-        "order", "order status", "track order", "tracking", "shipment",
-        "delivery", "package", "where is my order", "cancel order",
-        "return", "refund", "replace", "exchange", "pickup"
+        "order", "order status", "track order", "tracking", "shipment", "delivery",
+        "package", "where is my order", "cancel order", "return", "refund",
+        "replace", "exchange", "pickup"
     ],
     "Payments & Billing": [
-        "payment", "upi", "card", "wallet", "cod", "invoice", "coupon",
-        "billing", "charged", "charge", "emi", "price", "gst"
+        "payment", "upi", "card", "wallet", "cod", "invoice", "coupon", "billing",
+        "charged", "charge", "emi", "price", "gst"
     ],
     "Customer Support": [
         "support", "contact", "help", "issue", "complaint", "agent",
@@ -396,42 +381,30 @@ DEPT_KEYWORDS: Dict[str, List[str]] = {
 
 def classify_department_with_confidence(user_query: str) -> Tuple[Optional[str], float, Dict[str, int]]:
     text = (user_query or "").lower()
-    scores: Dict[str, int] = {}
-    for dept, kws in DEPT_KEYWORDS.items():
-        score = sum(1 for kw in kws if kw in text)
-        scores[dept] = score
-
-    # rank by score
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    top_dept, top_score = sorted_scores[0]
-
-    # if nothing matched
+    scores = {dept: sum(1 for kw in kws if kw in text) for dept, kws in DEPT_KEYWORDS.items()}
+    top_dept, top_score = max(scores.items(), key=lambda x: x[1])
     if top_score == 0:
         return None, 0.0, scores
-
-    # tie or near-tie? (within 1 point of second place)
-    if len(sorted_scores) > 1 and sorted_scores[1][1] >= top_score - 0.0:
+    # Ambiguity guard
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_scores) > 1 and sorted_scores[1][1] == top_score:
         return None, 0.0, scores
-
     conf = 0.6 if top_score == 1 else (0.75 if top_score == 2 else 0.9)
     return top_dept, conf, scores
 
 # --------------------
-# Thresholds (cosine)
+# Similarity thresholds
 # --------------------
 DEPT_SIM_THRESHOLDS = {
     "Orders & Returns": 0.80,
     "Payments & Billing": 0.78,
     "Customer Support": 0.75,
-    "HR & IT Helpdesk": 0.80,  # ✅ raised threshold for HR queries
+    "HR & IT Helpdesk": 0.80,
     None: 0.80,
 }
 
 # --------------------
-# Agent state, helpers, routing, tool_node, synthesis, graph, ask...
-
-# --------------------
-# Agent state
+# Agent State
 # --------------------
 class AgentState(BaseModel):
     user_input: str
@@ -442,22 +415,19 @@ class AgentState(BaseModel):
     retrieved: List[Dict[str, Any]] = Field(default_factory=list)
     intent: Optional[Literal["rag","order_status","return_create","ticket","human_escalation","unknown"]] = None
     answer: Optional[str] = None
-    confidence: float = 0.0   # overall answer confidence
-    reason: Optional[str] = None  # why we escalated / confidence is low
+    confidence: float = 0.0
+    reason: Optional[str] = None
 
 # --------------------
 # Helpers
 # --------------------
 def extract_answer_text(page_content: str) -> str:
-    """If content is 'Q: ...\\nA: ...', return only the A: part."""
     if not page_content:
         return page_content
-    lower = page_content.lower()
-    if "a:" in lower:
-        # take substring from first 'A:' onward (case-insensitive)
-        idx = lower.find("a:")
-        return page_content[idx+2:].strip().lstrip(":").strip()
-    # fallback: if prefixed with 'Q:' then strip it
+    lc = page_content.lower()
+    if "a:" in lc:
+        idx = lc.find("a:")
+        return page_content[idx + 2:].strip().lstrip(":").strip()
     if page_content.strip().startswith("Q:"):
         return page_content.replace("Q:", "", 1).strip()
     return page_content
@@ -467,189 +437,96 @@ def contains_any(text: str, keywords: List[str]) -> bool:
     return any(kw in low for kw in keywords)
 
 # --------------------
-# Routing
+# Intent routing
 # --------------------
 def route_intent(state: AgentState) -> Dict[str, Any]:
-    user_query = state.user_input
-    query_lower = (user_query or "").lower()
-
-    sentiment = detect_sentiment(user_query)
-    dept, dept_conf, _scores = classify_department_with_confidence(user_query)
-
-    # If user is upset → escalate
+    q = (state.user_input or "").lower()
+    sentiment = detect_sentiment(state.user_input)
+    dept, conf, _ = classify_department_with_confidence(state.user_input)
     if sentiment == "negative":
         intent = "human_escalation"
-    # order status
-    elif contains_any(query_lower, [
-        "order status", "track order", "where is my order", "tracking",
-        "shipment", "delivery", "package"
-    ]):
+    elif contains_any(q, ["order status", "track order", "where is my order", "tracking", "shipment", "delivery", "package"]):
         intent = "order_status"
-    # returns / exchanges → either policy (RAG) or action (return_create)
-    elif contains_any(query_lower, ["return", "refund", "replace", "exchange"]):
-        if contains_any(query_lower, ["policy", "how many", "days", "window"]):
-            intent = "rag"
-        else:
-            intent = "return_create"
-    # tickets / complaints
-    elif contains_any(query_lower, ["ticket", "helpdesk", "support issue", "complaint", "problem"]):
+    elif contains_any(q, ["return", "refund", "replace", "exchange"]):
+        intent = "rag" if contains_any(q, ["policy", "how many", "days", "window"]) else "return_create"
+    elif contains_any(q, ["ticket", "helpdesk", "support issue", "complaint", "problem"]):
         intent = "ticket"
     else:
         intent = "rag"
-
-    print(f"[route_intent] input={user_query!r} -> intent={intent}, dept={dept}, dept_conf={dept_conf:.2f}, sentiment={sentiment}")
-    return {"intent": intent, "department": dept, "dept_confidence": dept_conf, "sentiment": sentiment}
+    print(f"[route_intent] → intent={intent}, dept={dept}, conf={conf:.2f}, sentiment={sentiment}", flush=True)
+    return {"intent": intent, "department": dept, "dept_confidence": conf, "sentiment": sentiment}
 
 # --------------------
-# Tool node
+# Tool Node (lazy FAISS load)
 # --------------------
-def filter_by_department(results: List[Any], predicted_department: Optional[str]) -> List[Any]:
-    if not results:
-        return []
-    if predicted_department is None:
-        return results
-    filtered = [(doc, score) for doc, score in results
-                if (doc.metadata or {}).get("department") == predicted_department]
+def _filter_by_department(results, dept):
+    if not results or not dept:
+        return results or []
+    filtered = [(d, s) for d, s in results if (d.metadata or {}).get("department") == dept]
     return filtered or results
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
-    intent = state.intent
-    user_query = state.user_input or ""
-    predicted_department = state.department
-    dept_conf = state.dept_confidence
-    print(f"[tool_node] intent={intent}, dept={predicted_department}, dept_conf={dept_conf:.2f}, input={user_query!r}")
+    q = (state.user_input or "").strip()
+    dept, conf, intent = state.department, state.dept_confidence, state.intent
+    print(f"[tool_node] intent={intent}, dept={dept}, conf={conf:.2f}", flush=True)
 
-    # --- Direct tools ---
+    # direct intents
     if intent == "order_status":
-        # Ask for Order ID if missing
-        has_order_id = any(tok.startswith(("ORD-", "ord-")) or tok.isdigit() for tok in user_query.replace("#"," ").split())
-        if not has_order_id:
-            return {
-                "answer": "To check a specific order, please share your Order ID (e.g., ORD-1234).",
-                "tools_used": ["order_status_tool"],
-                "confidence": 0.65,
-                "reason": "order_id_missing"
-            }
-        return {
-            "answer": "Your order is being processed and will be shipped soon.",
-            "tools_used": ["order_status_tool"],
-            "confidence": 0.9
-        }
+        has_id = any(tok.startswith(("ORD-", "ord-")) or tok.isdigit() for tok in q.replace("#", " ").split())
+        if not has_id:
+            return {"answer": "Please share your Order ID (e.g. ORD-1234).", "tools_used": ["order_status_tool"], "confidence": 0.6}
+        return {"answer": "Your order is being processed and will be shipped soon.", "tools_used": ["order_status_tool"], "confidence": 0.9}
 
     if intent == "return_create":
-        return {
-            "answer": "Return initiated. You will receive pickup and label details via email.",
-            "tools_used": ["return_create_tool"],
-            "confidence": 0.9
-        }
+        return {"answer": "Return initiated. You’ll get pickup and label details by email.", "tools_used": ["return_create_tool"], "confidence": 0.9}
 
     if intent == "ticket":
-        return {
-            "answer": "A support ticket has been created. Someone will get back to you shortly.",
-            "tools_used": ["ticket_tool"],
-            "confidence": 0.85
-        }
+        return {"answer": "A support ticket has been created. Our team will reach out shortly.", "tools_used": ["ticket_tool"], "confidence": 0.85}
 
     if intent == "human_escalation":
-        return {
-            "answer": "I’m sorry for the inconvenience. Escalating to human support — someone will reach out to you soon.",
-            "tools_used": ["escalation"],
-            "confidence": 0.2,
-            "reason": "negative_sentiment"
-        }
+        return {"answer": "I’m sorry for the inconvenience. Escalating to human support.", "tools_used": ["escalation"], "confidence": 0.2}
 
-    # --- Retrieval (RAG) ---
+    # rag retrieval
     if intent == "rag":
-        # Low dept confidence → escalate (ambiguous / multi-dept)
-        if not predicted_department or dept_conf < 0.6:
-            return {
-                "answer": "Your query could relate to multiple areas. I’m escalating to human support to ensure it’s handled correctly.",
-                "tools_used": ["escalation"],
-                "confidence": 0.2,
-                "reason": "low_department_confidence"
-            }
+        if not dept or conf < 0.6:
+            return {"answer": "This may relate to multiple areas. Escalating to human support.", "tools_used": ["escalation"], "confidence": 0.2}
+
         try:
-            results = faq_vector_store.similarity_search_with_score(user_query, k=5)
-            results = [(doc, score) for doc, score in results if doc is not None]
-            results = filter_by_department(results, predicted_department)
-
-            if not results:
-                return {
-                    "answer": "Sorry, I couldn’t find reliable information in our knowledge base. Escalating to human support.",
-                    "tools_used": ["escalation"],
-                    "confidence": 0.2,
-                    "reason": "no_results"
-                }
-
-            top_doc, cosine_sim = results[0]
-            print(f"[tool_node] Top cosine similarity={cosine_sim:.4f}")
-            sim_threshold = DEPT_SIM_THRESHOLDS.get(predicted_department, DEPT_SIM_THRESHOLDS[None])
-
-            if cosine_sim < sim_threshold:
-                # Optional fuzzy fallback — only if very high fuzzy match
-                best_doc, best_fuzzy = None, 0.0
-                for doc in faq_documents:
-                    fs = fuzz.partial_ratio(user_query.lower(), doc.metadata.get("question","").lower()) / 100.0
-                    if fs > best_fuzzy:
-                        best_doc, best_fuzzy = doc, fs
-                if best_doc and best_fuzzy >= 0.92:
-                    dept_meta = best_doc.metadata.get("department", "unknown")
-                    clean_answer = extract_answer_text(best_doc.page_content)
-                    return {
-                        "answer": f"{clean_answer} (Dept: {dept_meta})",
-                        "tools_used": ["rag_fuzzy_fallback"],
-                        "retrieved": [{"question": best_doc.metadata.get("question",""),
-                                       "answer": clean_answer,
-                                       "fuzzy_score": float(best_fuzzy),
-                                       "source": dept_meta}],
-                        "confidence": float(min(0.85, best_fuzzy)),
-                        "reason": "fuzzy_match_high"
-                    }
-                return {
-                    "answer": "I’m not fully confident about the answer. Escalating to human support.",
-                    "tools_used": ["escalation"],
-                    "confidence": float(cosine_sim),
-                    "reason": "low_similarity"
-                }
-
-            # Passed threshold → return clean A: text
-            dept_meta = (top_doc.metadata or {}).get("department", "unknown")
-            clean_answer = extract_answer_text(top_doc.page_content)
-            return {
-                "answer": f"{clean_answer} (Dept: {dept_meta})",
-                "tools_used": ["rag_retrieval"],
-                "retrieved": [{"question": top_doc.metadata.get("question",""),
-                               "answer": clean_answer,
-                               "similarity": float(cosine_sim),
-                               "source": dept_meta}],
-                "confidence": float(cosine_sim)
-            }
-
+            faq_store, faq_docs = get_faq_vector_store()
         except Exception as e:
-            print(f"[tool_node] ❌ Retrieval error: {e}")
-            return {
-                "answer": "Something went wrong while searching. Escalating to human support.",
-                "tools_used": ["escalation"],
-                "confidence": 0.0,
-                "reason": "retrieval_exception"
-            }
+            print(f"[tool_node] ❌ FAQ init failed: {e}", flush=True)
+            return {"answer": "Error initializing knowledge base.", "tools_used": ["escalation"], "confidence": 0.0}
 
-    # Fallback
-    return {
-        "answer": "Could you please rephrase your request?",
-        "tools_used": ["fallback"],
-        "confidence": 0.3,
-        "reason": "fallback"
-    }
+        try:
+            results = faq_store.similarity_search_with_score(q, k=5)
+            results = _filter_by_department(results, dept)
+            if not results:
+                return {"answer": "Sorry, I couldn’t find info. Escalating.", "tools_used": ["escalation"], "confidence": 0.2}
+            doc, sim = results[0]
+            th = DEPT_SIM_THRESHOLDS.get(dept, 0.8)
+            if sim < th:
+                best_doc, best_fuzzy = None, 0.0
+                for d in faq_docs:
+                    fs = fuzz.partial_ratio(q.lower(), d.metadata.get("question", "").lower()) / 100.0
+                    if fs > best_fuzzy:
+                        best_doc, best_fuzzy = d, fs
+                if best_doc and best_fuzzy >= 0.92:
+                    ans = extract_answer_text(best_doc.page_content)
+                    dept_meta = best_doc.metadata.get("department", "unknown")
+                    return {"answer": f"{ans} (Dept: {dept_meta})", "tools_used": ["rag_fuzzy_fallback"], "confidence": float(best_fuzzy)}
+                return {"answer": "I’m not confident in my answer. Escalating.", "tools_used": ["escalation"], "confidence": float(sim)}
+            ans = extract_answer_text(doc.page_content)
+            dept_meta = doc.metadata.get("department", "unknown")
+            return {"answer": f"{ans} (Dept: {dept_meta})", "tools_used": ["rag_retrieval"], "confidence": float(sim)}
+        except Exception as e:
+            print(f"[tool_node] ❌ Retrieval failed: {e}", flush=True)
+            return {"answer": "Search error — escalating.", "tools_used": ["escalation"], "confidence": 0.0}
+
+    # fallback
+    return {"answer": "Could you please rephrase your question?", "tools_used": ["fallback"], "confidence": 0.3}
 
 # --------------------
-# Synthesis (no-op)
-# --------------------
-def synthesis_node(state: AgentState) -> Dict[str, Any]:
-    return {}
-
-# --------------------
-# Build Graph
+# Graph
 # --------------------
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -657,26 +534,22 @@ from langgraph.checkpoint.memory import MemorySaver
 graph = StateGraph(AgentState)
 graph.add_node("route", route_intent)
 graph.add_node("tool", tool_node)
-graph.add_node("synth", synthesis_node)
-
+graph.add_node("synth", lambda s: {})
 graph.add_edge(START, "route")
 graph.add_edge("route", "tool")
 graph.add_edge("tool", "synth")
 graph.add_edge("synth", END)
 
-memory = MemorySaver()
-app = graph.compile(checkpointer=memory)
+app = graph.compile(checkpointer=MemorySaver())
 
 # --------------------
-# Ask wrapper (returns only text as before)
+# ask()
 # --------------------
 def ask(user_query: str, thread_id: Optional[str] = None) -> str:
-    if thread_id is None:
-        import uuid
+    import uuid
+    if not thread_id:
         thread_id = f"thread_{uuid.uuid4().hex}"
-    out = app.invoke({"user_input": user_query},
-                     config={"configurable": {"thread_id": thread_id}})
-    # out contains 'confidence' and 'reason' too if you need them in API
+    out = app.invoke({"user_input": user_query}, config={"configurable": {"thread_id": thread_id}})
     return out.get("answer", "No answer generated.")
 
 # =========================
@@ -737,7 +610,7 @@ else:
             traceback.print_exc()
 
 # =========================
-# Cell C — Flask API (Render + Colab Compatible)
+# Cell C — Flask API (Render + Colab Compatible, Fast Bind)
 # =========================
 import os
 import sys
@@ -753,37 +626,50 @@ flask_app = Flask(__name__)
 CORS(flask_app)
 
 def _debug(msg: str):
-    """Safe print for Render logs."""
+    """Flush-safe logger."""
     print(msg, flush=True)
 
-# --- Core logic: agent call ---
+# --------------------
+# Agent bridge (lazy)
+# --------------------
 def call_agent(query: str) -> str:
-    """Routes query to the appropriate agent (ask(), graph_app.invoke(), etc.)"""
-    if "ask" in globals() and callable(globals()["ask"]):
-        _debug("[AGENT] Using ask()")
-        return globals()["ask"](query)
-    for name in ["agent_app", "graph_app", "app"]:
-        obj = globals().get(name)
-        if hasattr(obj, "invoke"):
-            _debug(f"[AGENT] Using graph '{name}'.invoke()")
-            cfg = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex}"}}
-            out = obj.invoke({"user_input": query}, config=cfg)
-            return out.get("answer", "No answer generated.")
-    return "⚠️ No active agent found."
+    """Safely route query to any active agent."""
+    try:
+        if "ask" in globals() and callable(globals()["ask"]):
+            _debug("[AGENT] Using ask()")
+            return globals()["ask"](query)
+        for name in ["agent_app", "graph_app", "app"]:
+            obj = globals().get(name)
+            if hasattr(obj, "invoke"):
+                _debug(f"[AGENT] Using {name}.invoke()")
+                out = obj.invoke(
+                    {"user_input": query},
+                    config={"configurable": {"thread_id": f"api-{uuid.uuid4().hex}"}}
+                )
+                return out.get("answer", "No answer generated.")
+        return "⚠️ No active agent found."
+    except Exception as e:
+        _debug(f"[AGENT] ❌ Error in call_agent: {e}")
+        traceback.print_exc(file=sys.stdout)
+        return f"Internal error: {e}"
 
-# --- Routes ---
+# --------------------
+# Routes
+# --------------------
 @flask_app.route("/ask", methods=["POST", "GET"])
 def ask_api():
     try:
-        _debug("\n[API] ▶️ /ask hit")
+        _debug("[API] /ask hit")
         query = ""
         if request.method == "POST":
-            if not request.is_json:
-                return jsonify({"error": "Content-Type must be application/json"}), 400
             data = request.get_json(silent=True) or {}
             query = (data.get("query") or "").strip()
         else:
             query = (request.args.get("query") or "").strip()
+
+        # If no query in GET, show a simple greeting or instructions
+        if request.method == "GET" and not query:
+            return jsonify({"message": "Welcome to ShopUNow API. Use /ask?query=hello or POST JSON {\"query\": ...}"}), 200
 
         if not query:
             return jsonify({"error": "Empty query"}), 400
@@ -794,15 +680,17 @@ def ask_api():
         return jsonify({"query": query, "answer": answer})
 
     except Exception as e:
-        _debug("[API] ❌ internal error")
+        _debug("[API] ❌ Exception:")
         traceback.print_exc(file=sys.stdout)
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
 @flask_app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "message": "ShopUNow backend running"})
+    return jsonify({"status": "ok", "message": "ShopUNow backend active"})
 
-# --- Helper: get Colab secret safely ---
+# --------------------
+# Colab / Render detection + ngrok (dev) support
+# --------------------
 def _get_colab_secret(name: str):
     try:
         from google.colab import userdata
@@ -810,29 +698,24 @@ def _get_colab_secret(name: str):
     except Exception:
         return None
 
-def find_free_port(default=5000):
-    """Find free port (to avoid collisions in Colab)."""
+def _find_free_port():
+    """Find a free port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
 
-# --- Decide Environment ---
-IS_RENDER = bool(os.getenv("RENDER_SERVICE_TYPE") or os.getenv("RENDER") or os.getenv("PORT"))
+IS_RENDER = bool(os.getenv("RENDER_SERVICE_TYPE") or os.getenv("PORT"))
 NGROK_AUTH_TOKEN = _get_colab_secret("NGROK_AUTH_TOKEN")
 
-# =============================
-# 🔹 Colab (Dev) Mode
-# =============================
+# ─────────────── Colab / Dev Mode ───────────────
 if not IS_RENDER and NGROK_AUTH_TOKEN:
-    PORT = find_free_port(5000)
-    _debug(f"▶️ [Colab Mode] Flask running on local port {PORT}")
+    PORT = _find_free_port()
+    _debug(f"▶️ [Colab Mode] Starting Flask on port {PORT}")
 
-    # Start Flask in background thread
     def _run_flask():
         flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
     threading.Thread(target=_run_flask, daemon=True).start()
 
-    # --- ngrok setup ---
     try:
         from pyngrok import ngrok
     except ImportError:
@@ -840,149 +723,158 @@ if not IS_RENDER and NGROK_AUTH_TOKEN:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=False)
         from pyngrok import ngrok
 
-    _debug("🔑 Setting ngrok auth token...")
-    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
     try:
+        _debug("🔑 Setting ngrok auth token")
+        ngrok.set_auth_token(NGROK_AUTH_TOKEN)
         ngrok.kill()
-    except Exception:
-        pass
-
-    try:
-        _debug(f"🌐 Starting ngrok tunnel for {PORT} …")
         tunnel = ngrok.connect(PORT, bind_tls=True)
         public_url = getattr(tunnel, "public_url", str(tunnel))
-        _debug(f"🚀 Public API URL: {public_url}")
+        _debug(f"🚀 Public URL: {public_url}")
 
-        # Save for frontend
         with open("/content/backend_url.txt", "w") as f:
             f.write(public_url.strip())
-        _debug("📂 backend_url.txt written")
+        _debug("📁 backend_url.txt written")
 
-        print("\n✅ Test your backend:")
-        print(f'curl -X POST "{public_url}/ask" -H "Content-Type: application/json" -d \'{{"query": "Hello?"}}\'')
-
+        print("\n✅ Test using this:")
+        print(f'curl -X POST "{public_url}/ask" -H "Content-Type: application/json" -d \'{{"query":"Hello"}}\'')
     except Exception as e:
-        _debug(f"❌ ngrok tunnel failed: {e}")
+        _debug(f"❌ ngrok setup failed: {e}")
         traceback.print_exc(file=sys.stdout)
 
-# =============================
-# 🔹 Render (Prod) Mode
-# =============================
+# ─────────────── Render / Production Mode ───────────────
 else:
-    PORT = int(os.environ.get("PORT", 8000))
-    _debug(f"▶️ [Render Mode] Flask binding to {PORT}")
+    PORT = int(os.getenv("PORT", 8000))
+    _debug(f"▶️ [Render Mode] Starting Flask on 0.0.0.0:{PORT}")
 
-    # Do NOT auto-run Flask — Gunicorn does that.
-    # Only run if invoked directly (useful for local dev)
-    if __name__ == "__main__" and not IS_RENDER:
-        _debug("🚀 Starting Flask locally...")
+    # Gunicorn will manage the server, so we only call run if __main__
+    if __name__ == "__main__":
+        _debug("🚀 Running Flask (dev fallback)")
         flask_app.run(host="0.0.0.0", port=PORT, debug=False)
 
 # =========================
-# Cell D – Streamlit Frontend (Colab dev only; skip in Render)
+# Cell D — Streamlit Frontend (Colab + Render)
 # =========================
 import os
+import sys
 import subprocess
 import threading
+import time
 
-# Skip frontend in Render / production environment
-if os.getenv("RENDER_SERVICE_TYPE") or os.getenv("PORT"):
-    print("[Render] Skipping Streamlit frontend cell.")
-else:
-    # Dev / Colab mode: ensure required libs
-    try:
-        import streamlit
-        import requests
-        import pyngrok
-    except ImportError:
-        # Install if missing, but use subprocess to avoid !pip syntax
-        deps = ["streamlit", "requests", "pyngrok"]
-        subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps], check=False)
+IS_RENDER = bool(os.getenv("PORT") or os.getenv("RENDER_SERVICE_TYPE"))
 
-    # Determine backend URL (auto-detect)
-    backend_url_file = "/content/backend_url.txt"
-    default_api_url = "http://127.0.0.1:5000/ask"
-    if os.path.exists(backend_url_file):
-        try:
-            with open(backend_url_file, "r") as f:
-                url = f.read().strip()
-            if url:
-                default_api_url = url.rstrip("/") + "/ask"
-        except Exception as e:
-            print("⚠️ Could not read backend_url.txt:", e)
+def _debug(msg: str):
+    print(msg, flush=True)
 
-    # Create a Streamlit app file
-    with open("app_frontend.py", "w") as f:
-        f.write(f"""
+# ============================================================
+# 🔹 COMMON STREAMLIT APP TEMPLATE
+# ============================================================
+def write_streamlit_app(default_api_url: str):
+    app_code = f"""
 import streamlit as st
 import requests
 
 st.set_page_config(page_title="ShopUNow Agent", layout="centered")
 st.title("🛍️ ShopUNow AI Assistant")
 
-api_url = st.sidebar.text_input("Flask API URL", value="{default_api_url}")
-openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
-gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
-ngrok_token = st.sidebar.text_input("ngrok Auth Token", type="password")
+api_url = st.sidebar.text_input("Backend URL", value="{default_api_url}")
+st.sidebar.caption("URL to Flask /ask endpoint")
 
-errors = []
-if not api_url.strip():
-    errors.append("❌ Flask API URL is required.")
-if not (openai_key.strip() or gemini_key.strip()):
-    errors.append("❌ At least one model key (OpenAI or Gemini) is required.")
-if not ngrok_token.strip():
-    errors.append("❌ ngrok Auth Token is required.")
+st.divider()
+st.subheader("💬 Chat")
 
-if errors:
-    for e in errors:
-        st.sidebar.error(e)
-    st.stop()
-else:
-    st.sidebar.success("✅ All required configuration set")
-
-st.session_state.setdefault("secrets", {{
-    "API_URL": api_url.strip(),
-    "OPENAI_API_KEY": openai_key.strip(),
-    "GEMINI_API_KEY": gemini_key.strip(),
-    "NGROK_AUTH_TOKEN": ngrok_token.strip()
-}})
-
-st.subheader("💬 Chat with ShopUNow Agent")
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
-query = st.text_input("Enter your question:")
+query = st.text_input("Ask something:")
 
 if st.button("Ask"):
     if query.strip():
         st.session_state.chat.append(("🧑 You", query))
         try:
-            resp = requests.post(st.session_state.secrets["API_URL"], json={{"query": query}}, timeout=20)
+            resp = requests.post(api_url, json={{"query": query}}, timeout=25)
             if resp.status_code == 200:
-                answer = resp.json().get("answer", "⚠️ No answer returned")
+                ans = resp.json().get("answer", "⚠️ No answer returned.")
             else:
-                answer = f"⚠️ Error {{resp.status_code}}: {{resp.text}}"
-        except Exception as error:
-            answer = f"⚠️ Request failed: {{error}}"
-        st.session_state.chat.append(("🤖 Agent", answer))
+                ans = f"⚠️ HTTP {{resp.status_code}}: {{resp.text}}"
+        except Exception as e:
+            ans = f"⚠️ Request failed: {{e}}"
+        st.session_state.chat.append(("🤖 Agent", ans))
 
 for sender, msg in st.session_state.chat:
     st.markdown(f"**{{sender}}:** {{msg}}")
-""")
+"""
+    with open("app_frontend.py", "w", encoding="utf-8") as f:
+        f.write(app_code.strip())
+
+# ============================================================
+# 🔹 RENDER MODE (Production)
+# ============================================================
+if IS_RENDER:
+    _debug("[Render] Setting up Streamlit frontend")
+
+    try:
+        import streamlit, requests
+    except ImportError:
+        deps = ["streamlit", "requests"]
+        subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps])
+        import streamlit, requests
+
+    # Prefer BACKEND_URL from environment; fallback to same host
+    backend_url = os.getenv("BACKEND_URL", "").strip().rstrip("/")
+    default_api_url = backend_url + "/ask" if backend_url else "/ask"
+
+    write_streamlit_app(default_api_url)
+
+    # On Render, gunicorn/startCommand will launch Streamlit:
+    # streamlit run app_frontend.py --server.port $PORT
+    # ✅ No background thread here — Render runs it automatically
+    _debug(f"✅ Streamlit app ready. BACKEND_URL={default_api_url}")
+
+# ============================================================
+# 🔹 COLAB / DEV MODE (Auto-ngrok)
+# ============================================================
+else:
+    _debug("[Colab/Dev] Launching Streamlit frontend...")
+
+    try:
+        import streamlit, requests
+        from pyngrok import ngrok
+    except ImportError:
+        deps = ["streamlit", "requests", "pyngrok"]
+        subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps])
+        import streamlit, requests
+        from pyngrok import ngrok
+
+    backend_url_file = "/content/backend_url.txt"
+    default_api_url = "http://127.0.0.1:5000/ask"
+
+    if os.path.exists(backend_url_file):
+        try:
+            with open(backend_url_file, "r") as f:
+                url = f.read().strip()
+            if url:
+                default_api_url = url.rstrip("/") + "/ask"
+                _debug(f"✅ Backend URL loaded: {default_api_url}")
+        except Exception as e:
+            _debug(f"⚠️ Could not read backend_url.txt: {e}")
+
+    write_streamlit_app(default_api_url)
 
     # Launch Streamlit in background
-    def run_streamlit():
-        subprocess.run(
-            [sys.executable, "-m", "streamlit", "run", "app_frontend.py", "--server.port", "8501", "--server.headless", "true"]
-        )
+    def run_frontend():
+        _debug("▶️ Starting Streamlit on port 8501...")
+        subprocess.run([
+            sys.executable, "-m", "streamlit", "run", "app_frontend.py",
+            "--server.port", "8501", "--server.headless", "true"
+        ])
 
-    threading.Thread(target=run_streamlit, daemon=True).start()
+    threading.Thread(target=run_frontend, daemon=True).start()
+    time.sleep(6)
 
-    # If ngrok token is provided, start a tunnel
     try:
-        from pyngrok import ngrok
-        print("🌐 Starting ngrok tunnel for Streamlit frontend...")
-        frontend_url = ngrok.connect(8501)
-        print("🚀 Frontend URL:", frontend_url)
+        _debug("🌍 Opening ngrok tunnel for Streamlit (8501)...")
+        tunnel = ngrok.connect(8501, bind_tls=True)
+        public_url = getattr(tunnel, "public_url", str(tunnel))
+        _debug(f"🚀 Streamlit frontend public URL: {public_url}")
     except Exception as e:
-        print("⚠️ Could not start frontend ngrok tunnel:", e)
+        _debug(f"⚠️ ngrok tunnel failed: {e}")
