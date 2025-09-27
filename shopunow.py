@@ -737,7 +737,7 @@ else:
             traceback.print_exc()
 
 # =========================
-# Cell C - Flask API with ngrok (collision-safe, deep debug, auto-reuse, frontend-sync)
+# Cell C — Flask API (Render + Colab Compatible)
 # =========================
 import os
 import sys
@@ -753,10 +753,12 @@ flask_app = Flask(__name__)
 CORS(flask_app)
 
 def _debug(msg: str):
+    """Safe print for Render logs."""
     print(msg, flush=True)
 
+# --- Core logic: agent call ---
 def call_agent(query: str) -> str:
-    """Your agent logic."""
+    """Routes query to the appropriate agent (ask(), graph_app.invoke(), etc.)"""
     if "ask" in globals() and callable(globals()["ask"]):
         _debug("[AGENT] Using ask()")
         return globals()["ask"](query)
@@ -767,16 +769,18 @@ def call_agent(query: str) -> str:
             cfg = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex}"}}
             out = obj.invoke({"user_input": query}, config=cfg)
             return out.get("answer", "No answer generated.")
-    raise RuntimeError("❌ No agent available. Run setup first.")
+    return "⚠️ No active agent found."
 
+# --- Routes ---
 @flask_app.route("/ask", methods=["POST", "GET"])
 def ask_api():
     try:
         _debug("\n[API] ▶️ /ask hit")
+        query = ""
         if request.method == "POST":
             if not request.is_json:
                 return jsonify({"error": "Content-Type must be application/json"}), 400
-            data = request.get_json(force=True, silent=True) or {}
+            data = request.get_json(silent=True) or {}
             query = (data.get("query") or "").strip()
         else:
             query = (request.args.get("query") or "").strip()
@@ -788,6 +792,7 @@ def ask_api():
         answer = call_agent(query)
         _debug(f"[API] Answer: {answer!r}")
         return jsonify({"query": query, "answer": answer})
+
     except Exception as e:
         _debug("[API] ❌ internal error")
         traceback.print_exc(file=sys.stdout)
@@ -795,9 +800,9 @@ def ask_api():
 
 @flask_app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "message": "ShopUNow Agent running"})
+    return jsonify({"status": "ok", "message": "ShopUNow backend running"})
 
-# --- Utility to detect Colab ngrok token ---
+# --- Helper: get Colab secret safely ---
 def _get_colab_secret(name: str):
     try:
         from google.colab import userdata
@@ -805,66 +810,73 @@ def _get_colab_secret(name: str):
     except Exception:
         return None
 
-NGROK_AUTH_TOKEN = _get_colab_secret("NGROK_AUTH_TOKEN")
-
 def find_free_port(default=5000):
+    """Find free port (to avoid collisions in Colab)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
 
-if NGROK_AUTH_TOKEN:
-    # ======== Colab / dev mode with ngrok ========
-    PORT = find_free_port(5000)
-    _debug(f"▶️ [Colab mode] Flask on {PORT}")
+# --- Decide Environment ---
+IS_RENDER = bool(os.getenv("RENDER_SERVICE_TYPE") or os.getenv("RENDER") or os.getenv("PORT"))
+NGROK_AUTH_TOKEN = _get_colab_secret("NGROK_AUTH_TOKEN")
 
+# =============================
+# 🔹 Colab (Dev) Mode
+# =============================
+if not IS_RENDER and NGROK_AUTH_TOKEN:
+    PORT = find_free_port(5000)
+    _debug(f"▶️ [Colab Mode] Flask running on local port {PORT}")
+
+    # Start Flask in background thread
     def _run_flask():
         flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
     threading.Thread(target=_run_flask, daemon=True).start()
 
-    # Setup ngrok
+    # --- ngrok setup ---
     try:
         from pyngrok import ngrok
     except ImportError:
-        _debug("[NGROK] Installing pyngrok...")
         import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=False)
         from pyngrok import ngrok
 
-    _debug("🔑 Setting ngrok auth token")
+    _debug("🔑 Setting ngrok auth token...")
     ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-
-    # Kill any prior tunnels
     try:
         ngrok.kill()
     except Exception:
         pass
 
     try:
-        _debug(f"🌐 Starting ngrok tunnel for port {PORT} …")
+        _debug(f"🌐 Starting ngrok tunnel for {PORT} …")
         tunnel = ngrok.connect(PORT, bind_tls=True)
         public_url = getattr(tunnel, "public_url", str(tunnel))
         _debug(f"🚀 Public API URL: {public_url}")
 
-        # Save for frontend in same notebook
+        # Save for frontend
         with open("/content/backend_url.txt", "w") as f:
             f.write(public_url.strip())
         _debug("📂 backend_url.txt written")
 
-        print("\nTest with:")
-        print(f'curl -X POST "{public_url}/ask" -H "Content-Type: application/json" -d "{{\\"query\\": \\"Hello?\\}}"')
+        print("\n✅ Test your backend:")
+        print(f'curl -X POST "{public_url}/ask" -H "Content-Type: application/json" -d \'{{"query": "Hello?"}}\'')
+
     except Exception as e:
         _debug(f"❌ ngrok tunnel failed: {e}")
         traceback.print_exc(file=sys.stdout)
 
+# =============================
+# 🔹 Render (Prod) Mode
+# =============================
 else:
-    # ======== Production / Render mode ========
-    PORT = int(os.environ.get("PORT", 5000))
-    _debug(f"▶️ [Prod mode] Flask on {PORT}")
+    PORT = int(os.environ.get("PORT", 8000))
+    _debug(f"▶️ [Render Mode] Flask binding to {PORT}")
 
-    # When run as script
-    if __name__ == "__main__":
-        flask_app.run(host="0.0.0.0", port=PORT)
+    # Do NOT auto-run Flask — Gunicorn does that.
+    # Only run if invoked directly (useful for local dev)
+    if __name__ == "__main__" and not IS_RENDER:
+        _debug("🚀 Starting Flask locally...")
+        flask_app.run(host="0.0.0.0", port=PORT, debug=False)
 
 # =========================
 # Cell D – Streamlit Frontend (Colab dev only; skip in Render)
