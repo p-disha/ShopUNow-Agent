@@ -47,50 +47,86 @@ Sentence-Transformers embeddings-	To convert document chunks into embedding vect
 """
 
 # =========================
-# Cell A: Setup and Vector Store + LLM
+# Cell A – Setup & LLM with safer secret handling
 # =========================
 
 import os
-from typing import List, Dict, Any, Optional, Literal
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
-
-import faiss
+import subprocess
+import sys
 import json
 import random
 import numpy as np
 
-# -------- Conditionally install (only in Colab / dev) --------
+# -- Install dev dependencies (only in Colab/dev)
 if not os.getenv("RENDER_SERVICE_TYPE") and not os.getenv("PORT"):
-    # in Colab / notebook mode
-    !pip install -qU langchain_community faiss-cpu langchain_openai langchain-google-genai pydantic typing_extensions vaderSentiment langgraph rapidfuzz
-    !pip install -qU flask flask-cors pyngrok
+    deps = [
+        "langchain_community",
+        "faiss-cpu",
+        "langchain-openai",
+        "langchain-google-genai",
+        "pydantic",
+        "typing_extensions",
+        "vaderSentiment",
+        "langgraph",
+        "rapidfuzz",
+        "flask",
+        "flask-cors",
+        "pyngrok",
+    ]
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps], check=False)
+    except Exception as ex:
+        print("⚠️ Dev install failed:", ex)
 
-# -------- API key setup via Colab secrets if available --------
+# -- Import core modules
+try:
+    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.docstore.in_memory import InMemoryDocstore
+    from langchain_core.documents import Document
+    from langchain_core.messages import HumanMessage, SystemMessage
+    import faiss
+except ImportError as e:
+    raise ImportError(
+        "Missing required LangChain integration modules. "
+        "Make sure `langchain-openai` and `langchain-google-genai` are installed."
+    ) from e
+
+# -- Try to fetch secrets from Colab user secrets if available
+openai_secret = None
+gemini_secret = None
 try:
     from google.colab import userdata
-    key = userdata.get("OPENAI_API_KEY")
-    if key:
-        os.environ["OPENAI_API_KEY"] = key
-    gem_key = userdata.get("GEMINI_API_KEY")
-    if gem_key:
-        os.environ["GOOGLE_API_KEY"] = gem_key
-except Exception:
-    pass
+    openai_secret = userdata.get("OPENAI_API_KEY")
+    gemini_secret = userdata.get("GEMINI_API_KEY")
 
+except Exception as e:
+    print("Could not import google.colab.userdata (maybe not in Colab):", e)
+
+# -- Set environment variables if secrets exist
+if openai_secret:
+    os.environ["OPENAI_API_KEY"] = openai_secret
+if gemini_secret:
+    os.environ["GOOGLE_API_KEY"] = gemini_secret
+
+# -- Read keys from environment now
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-assert OPENAI_API_KEY or GEMINI_API_KEY, "Please set OPENAI_API_KEY or GEMINI_API_KEY in environment."
+# -- Assertion: require at least one key in production (not in dev)
+if os.getenv("PORT") or os.getenv("RENDER_SERVICE_TYPE"):
+    # In Render / production
+    assert OPENAI_API_KEY or GEMINI_API_KEY, (
+        "In production, you must set OPENAI_API_KEY or GEMINI_API_KEY."
+    )
+else:
+    # In Colab/dev: warn if none
+    if not (OPENAI_API_KEY or GEMINI_API_KEY):
+        print("⚠️ Warning: No API keys set. Some functionality may be limited.")
 
-# -------- Embeddings and vector store --------
+# -- Proceed with embeddings, vector store, etc.
 embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-
-# Example (fallback) or minimal documents (you may replace with your FAQ load cell)
 faq_docs = [
     Document(page_content="Support hours are 9 AM–9 PM IST, Monday to Saturday", metadata={"department": "Customer Support"}),
     Document(page_content="How to contact support email or phone", metadata={"department": "Customer Support"}),
@@ -102,42 +138,36 @@ faq_docs = [
 
 dim = len(embeddings.embed_query("hello world"))
 index = faiss.IndexFlatL2(dim)
-
 vector_store = FAISS(
     embedding_function=embeddings,
     index=index,
     docstore=InMemoryDocstore({}),
     index_to_docstore_id={}
 )
-
 ids = [f"doc{i+1}" for i in range(len(faq_docs))]
 vector_store.add_documents(documents=faq_docs, ids=ids)
 
-# -------- LLM initialization --------
 def get_chat_model():
-    # If Gemini key present, try initialize Gemini
     if GEMINI_API_KEY:
         try:
             print("Using Gemini LLM")
             return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
         except Exception as e:
             print("Gemini init failed:", e)
-    # Else use OpenAI
     if OPENAI_API_KEY:
         try:
             print("Using OpenAI model")
             return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
         except Exception as e:
             print("OpenAI init failed:", e)
-    # Fallback dummy
     class _Mock:
-        def invoke(self, messages: List[Any]):
+        def invoke(self, messages):
             last_user = None
             for m in reversed(messages):
                 if isinstance(m, HumanMessage):
                     last_user = m
                     break
-            return type("Obj", (), {"content": "[MOCK] " + (last_user.content if last_user else "")})
+            return type("Resp", (), {"content": "[MOCK] " + (last_user.content if last_user else "")})
     print("Using mock LLM fallback")
     return _Mock()
 
@@ -241,7 +271,7 @@ import json
 import faiss
 import numpy as np
 import random
-from typing import Optional, List, Dict, Any, Literal, Tuple
+from typing import Optional, List, Dict, Any, Literal, Tuple, Annotated
 from pydantic import BaseModel, Field
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from rapidfuzz import fuzz
@@ -408,8 +438,8 @@ class AgentState(BaseModel):
     department: Optional[str] = None
     dept_confidence: float = 0.0
     sentiment: Optional[Literal["negative","neutral","positive"]] = None
-    tools_used: Annotated[List[str], add] = Field(default_factory=list)
-    retrieved: Annotated[List[Dict[str, Any]], add] = Field(default_factory=list)
+    tools_used: List[str] = Field(default_factory=list)
+    retrieved: List[Dict[str, Any]] = Field(default_factory=list)
     intent: Optional[Literal["rag","order_status","return_create","ticket","human_escalation","unknown"]] = None
     answer: Optional[str] = None
     confidence: float = 0.0   # overall answer confidence
