@@ -1,4 +1,4 @@
-# render.yaml (in your repo root)
+# render.yaml
 services:
   - type: web
     name: shopunow-backend
@@ -6,10 +6,9 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow.ipynb
     startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 2 --timeout 600 --worker-class gthread
-    healthCheckPath: /ask
+    healthCheckPath: /         # use root or simple endpoint
     envVars:
       - key: OPENAI_API_KEY
-        # Remove sync: false so Render picks up the secret
       - key: GOOGLE_API_KEY
 
   - type: web
@@ -17,7 +16,7 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow_frontend.ipynb
-    startCommand: streamlit run app_frontend.py --server.port $PORT
+    startCommand: streamlit run app_frontend.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
       - key: BACKEND_URL
         fromService:
