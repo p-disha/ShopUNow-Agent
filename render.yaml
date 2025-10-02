@@ -1,4 +1,3 @@
-# render.yaml
 services:
   - type: web
     name: shopunow-backend
@@ -7,7 +6,7 @@ services:
     buildCommand: |
       pip install -r requirements.txt
       jupyter nbconvert --to python ShopUNow.ipynb
-    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --worker-class gthread
+    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     healthCheckPath: /ask
     envVars:
       - key: OPENAI_API_KEY
