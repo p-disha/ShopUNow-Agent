@@ -9,7 +9,7 @@ pydantic==2.11.9
 vaderSentiment==3.3.2
 rapidfuzz==3.14.1
 
-langchain-core==0.3.75
+langchain-core==0.3.76
 langchain-community==0.3.27
 langchain-openai==0.3.33
 langchain-google-genai==2.1.12
