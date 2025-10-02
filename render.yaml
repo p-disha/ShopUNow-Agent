@@ -4,9 +4,11 @@ services:
     name: shopunow-backend
     env: python
     plan: starter
-    buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow.ipynb
-    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 2 --timeout 600 --worker-class gthread
-    healthCheckPath: /         # use root or simple endpoint
+    buildCommand: |
+      pip install -r requirements.txt
+      jupyter nbconvert --to python ShopUNow.ipynb
+    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --worker-class gthread
+    healthCheckPath: /ask
     envVars:
       - key: OPENAI_API_KEY
       - key: GOOGLE_API_KEY
@@ -15,7 +17,9 @@ services:
     name: shopunow-frontend
     env: python
     plan: starter
-    buildCommand: pip install -r requirements.txt && jupyter nbconvert --to python shopunow_frontend.ipynb
+    buildCommand: |
+      pip install -r requirements.txt
+      jupyter nbconvert --to python shopunow_frontend.ipynb
     startCommand: streamlit run app_frontend.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
       - key: BACKEND_URL
