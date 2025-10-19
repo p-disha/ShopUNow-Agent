@@ -1,0 +1,38 @@
+services:
+  # -------------------------
+  # 🧠 Backend Service (Flask + Gunicorn)
+  # -------------------------
+  - type: web
+    name: shopunow-backend
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      jupyter nbconvert --to python ShopUNow.ipynb || true
+    startCommand: gunicorn shopunow:flask_app --bind 0.0.0.0:$PORT --workers 2 --timeout 180
+    healthCheckPath: /ask
+    envVars:
+      - key: FLASK_APP
+        value: shopunow:flask_app
+      - key: OPENAI_API_KEY
+      - key: GOOGLE_API_KEY
+
+  # -------------------------
+  # 🎨 Frontend Service (Streamlit)
+  # -------------------------
+  - type: web
+    name: shopunow-frontend
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      jupyter nbconvert --to python ShopUNow.ipynb || true
+    startCommand: streamlit run app_frontend.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: BACKEND_URL
+        fromService:
+          name: shopunow-backend
+          type: web
+          property: url
