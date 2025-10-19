@@ -818,10 +818,12 @@ if IS_RENDER:
         deps = ["streamlit", "requests"]
         subprocess.run([sys.executable, "-m", "pip", "install", "-qU", *deps])
         import streamlit, requests
-
-    # Prefer BACKEND_URL from environment; fallback to same host
-    backend_url = os.getenv("BACKEND_URL", "").strip().rstrip("/")
-    default_api_url = backend_url + "/ask" if backend_url else "/ask"
+    # Automatically detect Render-provided service URL
+    backend_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if backend_url:
+        default_api_url = backend_url + "/ask"
+    else:
+        default_api_url = "/ask"
 
     write_streamlit_app(default_api_url)
 
